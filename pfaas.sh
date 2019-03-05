@@ -35,7 +35,7 @@ return_404() {
 
 
 while true; do
-  cat "${PFAAS_PIPE}" | nc -lv ${PFAAS_PORT} > >(
+  cat "${PFAAS_PIPE}" | nc -n -l -p ${PFAAS_PORT} > >(
     while read l; do
       l=$(echo "$l" | tr -d '[\r\n]')
 
