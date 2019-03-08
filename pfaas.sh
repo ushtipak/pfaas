@@ -21,7 +21,6 @@ return_random_fact() {
   id=$RANDOM
   let "id %= ${#FACTS[@]}"
   fact="${FACTS[${id}]}"
-
   echo "{\"id\": \"${id}\", \"fact\": \"${fact}\"}" > "${PFAAS_PIPE}"
 }
 
@@ -38,21 +37,15 @@ while true; do
   cat "${PFAAS_PIPE}" | nc -n -l -p ${PFAAS_PORT} > >(
     while read l; do
       l=$(echo "$l" | tr -d '[\r\n]')
-
       if echo "$l" | grep -qE '^GET /'; then
         req=$(echo "$l" | cut -d ' ' -f2)
         if echo $req | grep -qE '^/api/fact'; then
-
-          id=$(echo $(echo $req | awk -F "/" '{print $NF}' | tr -cd [:digit:]))
+          id=$(echo $req | awk -F "/" '{print $NF}' | tr -cd [:digit:])
           [[ ${id} != "" ]] && return_specific_fact ${id} || return_random_fact
-
-
         else
           return_404
-
         fi
       fi
     done
   )
-
 done
