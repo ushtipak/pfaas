@@ -1,0 +1,165 @@
+name: rad12-build-and-deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_tag:
+        description: 'Deployment build tag'
+        required: true
+
+concurrency:
+  group: ${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RAD12REGISTRY: "${{ secrets.RAD12_HOSTNAME }}.rad12.io:40176"
+
+jobs:
+  rad12-build-and-deploy:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Retrieve Docker login for Rad12 private registry
+        run: echo "${RAD12_DOCKERCONFIG}" > ~/.docker/config.json
+        env:
+          RAD12_DOCKERCONFIG: "${{ secrets.RAD12_DOCKERCONFIG }}"
+
+      - name: Build image
+        run: docker build . --build-arg="USERNAME=${{ github.actor }}" --build-arg="TOKEN=${{ secrets.USER_PAT }}" -t ${RAD12REGISTRY}/app-${{ github.event.repository.name }}:${{ github.event.inputs.build_tag }}
+
+      - name: Push image to registry
+        run: docker push ${RAD12REGISTRY}/app-${{ github.event.repository.name }}:${{ github.event.inputs.build_tag }}
+
+      - name: Retrieve Rad12 kubeconfig from secrets
+        run: mkdir /opt/rad12 && echo "${RAD12_KUBECONFIG}" > /opt/rad12/kubeconfig
+        env:
+          RAD12_KUBECONFIG: "${{ secrets.RAD12_KUBECONFIG }}"
+
+      - name: Create app secrets on Rad12 Kubernetes
+        run: |
+          KEYS=$(echo $SECRETS | jq -r 'keys[]')
+          secret_args=""
+          for key in $KEYS; do
+            if [[ "$key" != "RAD12_KUBECONFIG" && "$key" != "RAD12_DOCKERCONFIG" ]]; then
+              value=$(echo $SECRETS | jq -r ".$key");
+              echo -n "${value}" > "secret-${key}"
+              secret_args+="--from-file=$key=./secret-${key} "
+            fi
+          done;
+          kubectl --insecure-skip-tls-verify --kubeconfig=/opt/rad12/kubeconfig delete secret app-${{ github.event.repository.name }}-secrets --ignore-not-found
+          kubectl --insecure-skip-tls-verify --kubeconfig=/opt/rad12/kubeconfig create secret generic app-${{ github.event.repository.name }}-secrets $secret_args
+        env:
+          SECRETS: '${{ toJson(secrets) }}'
+
+      - name: Create app variables on Rad12 Kubernetes
+        run: |
+          if [[ "$VARIABLES" != "null" ]]; then
+            KEYS=$(echo "$VARIABLES" | jq -r 'keys[]' || echo "-1")
+            variable_args=""
+            for key in $KEYS; do
+              value=$(echo $VARIABLES | jq -r ".$key");
+              echo -n "${value}" > "variable-${key}"
+              variable_args+="--from-file=$key=./variable-${key} "
+            done;
+            kubectl --insecure-skip-tls-verify --kubeconfig=/opt/rad12/kubeconfig delete configmap app-${{ github.event.repository.name }}-variables --ignore-not-found
+            kubectl --insecure-skip-tls-verify --kubeconfig=/opt/rad12/kubeconfig create configmap app-${{ github.event.repository.name }}-variables $variable_args
+          else
+            kubectl --insecure-skip-tls-verify --kubeconfig=/opt/rad12/kubeconfig delete configmap app-${{ github.event.repository.name }}-variables --ignore-not-found
+            kubectl --insecure-skip-tls-verify --kubeconfig=/opt/rad12/kubeconfig create configmap app-${{ github.event.repository.name }}-variables --from-literal=cm=placeholder
+          fi
+        env:
+          VARIABLES: '${{ toJson(vars) }}'
+
+      - name: Generate K8s Deployment descriptor
+        run: |
+          if [[ ! -d desc ]]; then mkdir desc; fi
+          echo "---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: app-${{ github.event.repository.name }}
+            labels:
+              app: app-${{ github.event.repository.name }}
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: app-${{ github.event.repository.name }}
+            template:
+              metadata:
+                labels:
+                  app: app-${{ github.event.repository.name }}
+              spec:
+                imagePullSecrets:
+                  - name: rad12registry
+                containers:
+                  - name: app-${{ github.event.repository.name }}
+                    image: ${RAD12REGISTRY}/app-${{ github.event.repository.name }}:${{ github.event.inputs.build_tag }}
+                    imagePullPolicy: Always
+                    envFrom:
+                      - secretRef:
+                          name: app-${{ github.event.repository.name }}-secrets
+                      - configMapRef:
+                          name: app-${{ github.event.repository.name }}-variables" > desc/Deployment.yml
+
+      - name: Generate K8s Service descriptor
+        run: |
+          if [[ "$(grep 'EXPOSE ' Dockerfile)" != "" ]]; then
+            echo "---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: app-${{ github.event.repository.name }}
+            labels:
+              app: app-${{ github.event.repository.name }}
+          spec:
+            ports:" > desc/Service.yml
+            
+            for port in $(grep EXPOSE Dockerfile | awk '{print $2}'); do
+              echo "    - name: tcp-${port}
+                protocol: TCP
+                port: ${port}
+                targetPort: ${port}" >> desc/Service.yml
+            done
+            echo "  selector:
+              app: app-${{ github.event.repository.name }}" >> desc/Service.yml
+          fi
+
+      - name: Generate K8s Ingress descriptor
+        run: |
+          if [[ "$(grep 'EXPOSE ' Dockerfile)" != "" ]]; then
+            port=$(grep EXPOSE Dockerfile | head -1 | awk '{print $2}')
+            echo "---
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: app-${{ github.event.repository.name }}
+            annotations:
+              ingress.kubernetes.io/ssl-redirect: 'true'
+          spec:
+            tls:
+            - hosts:
+              - ${{ secrets.RAD12_HOSTNAME }}.rad12.io
+              secretName: rad12-tls
+            rules:
+            - http:
+                paths:
+                - path: ${{ secrets.RAD12_INGRESSPATH}}
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: app-${{ github.event.repository.name }}
+                      port:
+                        number: ${port}" > desc/Ingress.yml
+          fi
+          cat desc/Ingress.yml
+
+      - name: Apply all manifests
+        run: for desc in desc/*; do kubectl --insecure-skip-tls-verify --kubeconfig=/opt/rad12/kubeconfig apply -f ${desc}; done
+
+      - name: Perform service rolling update
+        run: kubectl --insecure-skip-tls-verify --kubeconfig=/opt/rad12/kubeconfig rollout restart deploy app-${{ github.event.repository.name }}
+
