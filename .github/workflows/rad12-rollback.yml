@@ -1,0 +1,62 @@
+name: rad12-rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_tag:
+        description: 'Build tag to rollback to'
+        required: true
+
+concurrency:
+  group: ${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RAD12REGISTRY: "${{ secrets.RAD12_HOSTNAME }}.rad12.io:40176"
+
+jobs:
+  rad12-rollback:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Retrieve Rad12 kubeconfig from secrets
+        run: mkdir /opt/rad12 && echo "${RAD12_KUBECONFIG}" > /opt/rad12/kubeconfig
+        env:
+          RAD12_KUBECONFIG: ${{ secrets.RAD12_KUBECONFIG }}
+
+      - name: Generate K8s Deployment descriptor
+        run: |
+          if [[ ! -d desc ]]; then mkdir desc; fi
+          echo "---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: app-${{ github.event.repository.name }}
+            labels:
+              app: app-${{ github.event.repository.name }}
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: app-${{ github.event.repository.name }}
+            template:
+              metadata:
+                labels:
+                  app: app-${{ github.event.repository.name }}
+              spec:
+                imagePullSecrets:
+                  - name: rad12registry
+                containers:
+                  - name: app-${{ github.event.repository.name }}
+                    image: ${RAD12REGISTRY}/app-${{ github.event.repository.name }}:${{ github.event.inputs.build_tag }}
+                    imagePullPolicy: Always
+                    envFrom:
+                      - secretRef:
+                          name: app-${{ github.event.repository.name }}-secrets" > desc/Deployment.yml
+
+      - name: Apply Deploy manifest
+        run: kubectl --insecure-skip-tls-verify --kubeconfig=/opt/rad12/kubeconfig apply -f desc/Deployment.yml
+
+      - name: Perform service rolling update
+        run: kubectl --insecure-skip-tls-verify --kubeconfig=/opt/rad12/kubeconfig rollout restart deploy app-${{ github.event.repository.name }}
+
